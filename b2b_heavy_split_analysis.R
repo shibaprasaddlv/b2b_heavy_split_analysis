@@ -6,7 +6,7 @@ library(ompr)
 library(ompr.roi)
 library(ROI.plugin.symphony)
 library(ggrepel)
-# Mention parameters in chunks to get notebook outputs
+# Mention parameters in chunks to get notebook output
 library(palmerpenguins)
 library(TSP)
 library(fields)
