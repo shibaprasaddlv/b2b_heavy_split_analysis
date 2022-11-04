@@ -1,0 +1,875 @@
+---
+title: "B2B Heavy Split Result Analysis"
+output: html_notebook
+---
+
+Load the libraries
+
+```{r}
+library(tidyverse)
+library(googlesheets4)
+library(lubridate)
+library(dbplyr)
+library(DBI)
+```
+
+Property details to merge the names.
+
+```{r}
+con <- dbConnect(
+  RPresto::Presto(),
+  host = 'presto-adhoc.delhivery.com',
+  port=8889,
+  user='r-studio-us-east',
+  source='rstudio',
+  catalog='awsdatacatalog',
+  schema='psi_reporting',
+)
+
+con %>%
+  tbl(in_schema("hudi_db", "hudi_facility_parquet")) %>%
+  group_by(property_facility_facility_code) %>%
+  filter(action_date == max(action_date)) %>%
+  ungroup() %>%
+  #filter(property_facility_active==TRUE) %>%
+  #filter(str_detect(property_facility_facility_type, 'SC')) %>%
+  select(
+    cn = property_facility_name,
+    type = property_facility_facility_type,
+    cnid = property_facility_facility_code,
+    is_active = property_facility_active,
+    plat = property_lat,
+    plong = property_long,
+    ptype = property_facility_facility_type,
+    city = property_city,
+    area = property_area,
+    allocated_area = property_facility_allocated_area,
+    pincode = property_pin_code,
+    rent = property_agreement_details_rent
+  ) %>%
+  collect() -> properties
+```
+
+
+Loading all the data. Setting the path.
+
+```{r}
+
+HEAVY_TRIP_COST_PATH <-
+  "/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/heavy_sc_trip_costs.RData"
+
+B2B_TRIP_COST_PATH <-
+  "/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/b2b_sc_trip_costs.RData"
+
+COMBINED_TRIP_COST_PATH <-
+  "/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/combined_sc_trip_costs.RData"
+
+PATH_SC_DROP_DATA <-
+  "/rstudio-dwh-s3/shibaprasad/sc_pickup_drop_august2022.RData"
+
+```
+
+```{r}
+b2b_sc_trip_costs <- get(load(B2B_TRIP_COST_PATH))
+heavy_sc_trip_costs <-get(load(HEAVY_TRIP_COST_PATH))
+combined_sc_trip_costs <- get(load(COMBINED_TRIP_COST_PATH))
+fmlm_sc <- get(load(PATH_SC_DROP_DATA))
+```
+
+```{r}
+
+fmlm_sc %>%
+  filter(purpose == 'LM') %>%
+  mutate(date = as.Date(dispatch_date),
+         product_type = 'combined') %>%
+  group_by(cnid, date, product_type) %>%
+  summarise(product_weight = sum(weight, na.rm = T),
+            .groups = 'drop') %>%
+  bind_rows(
+    fmlm_sc %>%
+      filter(purpose == 'LM') %>%
+      mutate(date = as.Date(dispatch_date)) %>%
+      group_by(cnid, date, product_type) %>%
+      summarise(
+        product_weight = sum(weight, na.rm = T),
+        .groups = 'drop'
+      )
+  )-> date_wise_load
+
+date_wise_load
+  
+```
+
+Save the results.
+
+```{r}
+bind_rows(b2b_sc_trip_costs,
+          heavy_sc_trip_costs,
+          combined_sc_trip_costs) %>%
+  mutate(product_type = ifelse(product_type == 'Heavy, B2B', 'combined', product_type)) %>%
+  group_by(cnid, date, product_type) %>%
+  summarise(trip_cost = sum(trip_cost, na.rm = T), .groups = 'drop') %>%
+  left_join(date_wise_load, by = c("cnid", "date", "product_type")) %>%
+  mutate(
+    cpk = round(signif(trip_cost / product_weight), 2),
+    trip_cost = round(trip_cost),
+    product_weight_in_kg = round(product_weight)
+  ) %>%
+  select(-product_weight) %>%
+  #group_by(date, cnid) %>%
+  pivot_wider(
+    names_from = product_type,
+    values_from = c(trip_cost, product_weight_in_kg, cpk)
+  ) %>%
+  mutate(
+    b2b_weight_prop = round(signif(
+      product_weight_in_kg_B2B / (product_weight_in_kg_Heavy + product_weight_in_kg_B2B)
+    ), 2),
+    trip_cost_separate = trip_cost_Heavy + trip_cost_B2B,
+    cost_diff = trip_cost_combined - trip_cost_separate,
+    cost_diff_perc = round(signif(
+      100 * (trip_cost_combined - trip_cost_separate) / trip_cost_combined
+    ), 2)
+  ) %>%
+  left_join(properties %>% distinct(cnid, cn, city), by = 'cnid') %>%
+  # mutate(dow=weekdays(date)) %>%
+  # filter(dow!='Sunday') %>%
+  select(
+    cn,
+    cnid,
+    city,
+    date,
+    trip_cost_B2B,
+    trip_cost_Heavy,
+    trip_cost_separate,
+    trip_cost_combined,
+    cpk_B2B,
+    cpk_Heavy,
+    cpk_combined,
+    cost_diff,
+    cost_diff_perc,
+    everything()
+  ) %>%
+  drop_na()-> trip_cost_comparison
+
+trip_cost_comparison
+  
+```
+
+```{r}
+gs4_auth('shibaprasad.bhattacharya@delhivery.com', use_oob = T)
+
+sheet_write(trip_cost_comparison, "1xu6_z447l1i0tOBKfhNv-8fOHfp8k1c8GqK7x6vsUJo", 'cost_delta')
+```
+
+```{r}
+Sys.umask(002)
+save(trip_cost_comparison, file = '/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/trip_cost_comparison.RData')
+```
+
+
+
+```{r}
+trip_cost_comparison %>%
+  drop_na() %>%
+  distinct(cnid, date) %>%
+  count(cnid) %>%
+  arrange(desc(n))
+```
+```{r}
+trip_cost_comparison %>%
+  # mutate(dow=weekdays(date)) %>%
+  # filter(dow!='Sunday') %>%
+  #filter(cost_diff_perc<50 & cost_diff_perc>-50) %>%
+  ggplot() + geom_histogram(aes(x = cost_diff_perc), binwidth = 5) +
+  xlab('Cost difference percentage') + theme_bw() +
+  labs(title = 'Histogram of the percentage difference of cost',
+       subtitle = 'Difference = Combined ops - Separate ops')
+```
+
+```{r}
+cor(trip_cost_comparison$cost_diff_perc, trip_cost_comparison$b2b_weight_prop)
+  
+```
+
+```{r}
+trip_cost_comparison %>%
+  mutate(dow=weekdays(date)) %>%
+  filter(dow!='Sunday' & date!=as.Date('2022-08-15') & cost_diff_perc>=0) %>%
+  distinct(cn, cnid, date)
+  count(cn, cnid) %>%
+  arrange(desc(n)) %>%
+  pull(n) %>% sum()
+```
+
+```{r}
+get(load("/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/split_analysis_trip_detailsB2B_.RData"))-> b2b_underutilized_trips
+```
+
+```{r}
+b2b_underutilized_trips %>%
+  left_join(properties %>% select(cn, cnid), by = "cnid")-> b2b_underutilized_trips
+b2b_underutilized_trips
+```
+
+```{r}
+b2b_underutilized_trips %>%
+  distinct(cn, cnid, date) %>%
+  count(cn, cnid) %>%
+  arrange(desc(n))
+```
+
+
+#Size of the SC
+#Number of docks
+
+```{r}
+trip_cost_comparison %>%
+  group_by(cnid) %>%
+  summarise(combined = sum(trip_cost_combined, na.rm=T),
+            b2b = sum(trip_cost_B2B, na.rm=T),
+            heavy = sum(trip_cost_Heavy, na.rm=T), .groups= 'drop') %>%
+  mutate(delta = combined - (b2b+heavy)) %>%
+  left_join(properties %>% select(cn, cnid)) %>%
+  filter(delta>0) %>%
+  arrange(desc(delta))
+```
+
+
+Buffer for each facility?
+1rs/kg B2B, 3rs/kg for Heavy
+
+```{r}
+library(tidytable)
+
+trip_cost_comparison %>%
+  summarise.(
+    b2b_cpk = sum(trip_cost_B2B) / sum(product_weight_in_kg_B2B), 
+    heavy_cpk = sum(trip_cost_Heavy) / sum(product_weight_in_kg_Heavy),
+    combined_cpk = sum(trip_cost_combined) / sum(product_weight_in_kg_combined)
+  )
+```
+
+
+```{r}
+#save(b2b_underutilized_trips, file = "/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/split_analysis_trip_detailsB2B_.RData")
+```
+
+
+```{r}
+b2b_underutilized_trips %>%
+  mutate(dow = weekdays(date)) %>%
+  filter(date=='2022-08-01' & cnid=='IN700069A1A')
+
+
+
+  filter(contracted_shift <= 2) %>%
+  ggplot() + geom_histogram(aes(x=contracted_shift)) + geom_density(aes(x=contracted_shift)) + theme_bw() +
+  ggtitle('Histogram for B2B trip utilisation')
+```
+
+```{r}
+combined_underutilized_trips %>%
+  mutate(dow = weekdays(date)) %>%
+  filter(date=='2022-08-01' & cnid=='IN700069A1A')
+```
+
+
+
+```{r}
+quantile(b2b_underutilized_trips$contracted_shift)
+```
+
+
+```{r}
+get(load("/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/split_analysis_trip_detailsHeavy, B2B_.RData"))-> combined_underutilized_trips
+```
+
+```{r}
+combined_underutilized_trips %>%
+  left_join(properties %>% select(cn, cnid), by = "cnid")-> combined_underutilized_trips
+combined_underutilized_trips
+```
+
+```{r}
+#save(combined_underutilized_trips,file="/rstudio-dwh-s3/shibaprasad/b2b_heavy_split/split_analysis_trip_detailsHeavy, B2B_.RData")
+```
+
+
+```{r}
+combined_underutilized_trips %>%
+  filter(contracted_shift<=2) %>%
+  ggplot() + geom_histogram(aes(x=contracted_shift, y=..density..)) + theme_bw() +
+  ggtitle('Histogram for B2B+Heavy trip utilisation')
+```
+
+```{r}
+quantile(combined_underutilized_trips$contracted_shift)
+```
+
+
+```{r}
+fmlm_sc %>%
+  filter(purpose=='LM') %>%
+  mutate(vehicle_type=tolower(vehicle_type)) %>%
+  distinct(vehicle_type) %>% pull()
+```
+
+```{r}
+dispatch_start_date <- as.Date('2022-08-01')
+dispatch_end_date <- as.Date('2022-08-30')
+
+start_date <- as.character(dispatch_start_date - 10)
+end_date <- as.character(dispatch_end_date + 10)
+
+
+tbl(con, in_schema('express_dwh', 'dispatch_lm_s3_parquet')) %>%
+  filter(ad >= start_date & ad < end_date) %>%
+  select(
+    cnid,
+    cn,
+    dwbn,
+    wbn,
+    md,
+    mts_distance,
+    ds,
+    cd,
+    cpd,
+    mts_distance,
+    wbn_count,
+    vt,
+    mts_confidence
+  ) %>%
+  filter(ds == 'complete' & !is.na(mts_distance)) %>%
+  mutate(
+    dispatch_duration = sql("date_diff('minute', cd, cpd)"),
+    dispatch_start_date = sql("date_trunc('day', date_add('minute', 330, cd))"),
+    dispatch_end_date = sql("date_trunc('day', date_add('minute', 330, cpd))"),
+    cd = sql("date_add('minute', 330, cd)"),
+    cpd = sql("date_add('minute', 330, cpd)")
+  )%>%
+  collect() -> lm
+```
+
+```{r}
+lm %>%
+  left_join(properties %>% select(type, cnid)) %>%
+  filter(str_detect(type, 'SC'))-> lm_sc_trips
+```
+
+
+
+
+```{r}
+Sys.umask(002)
+
+save(lm_sc_trips, file='/rstudio-dwh-s3/shibaprasad/lm_sc_trip_details.Rdata')
+```
+
+
+```{r}
+lm %>%
+  unnest(wbn)
+```
+
+
+```{r}
+tbl(con, in_schema('hudi_db', 'hudi_package_wbn_latest_parquet')) %>%
+  filter(ad >= start_date & !is.na(dwbn)) %>%
+  group_by(dwbn, cs_lat, cs_lon) %>%
+  summarise(weight = sum(int_wt_iwt, na.rm = T) / 1000,
+            .groups = 'drop') %>%
+  collect()-> dwbn_details
+
+dwbn_details
+```
+
+
+
+```{r}
+dispatch_start_date <- as.Date('2022-08-01')
+dispatch_end_date <- as.Date('2022-08-30')
+
+start_date <- as.character(dispatch_start_date - 10)
+end_date <- as.character(dispatch_end_date + 10)
+```
+
+```{r}
+con %>%
+  tbl(in_schema('express_dwh', "dm_package_last_mile_data")) %>%
+  filter(dispatch_date>=start_date & dispatch_date<=end_date) %>%
+  filter(
+      dispatch_datetime >= dispatch_start_date & dispatch_datetime <= dispatch_end_date
+  ) %>%
+  select(
+    wbn,
+    cnid = destination_centre_id,
+    dispatch_id = lm_dispatch_id,
+    dispatch_date = dispatch_datetime,
+    customer_lat,
+    customer_long,
+    product_type
+  ) %>%
+  group_by(wbn) %>%
+  filter(dispatch_date==max(dispatch_date)) %>%
+  ungroup() %>%
+  mutate(purpose = 'LM') %>%
+  left_join(
+    con %>%
+      tbl(in_schema(
+        "hudi_db", "hudi_package_wbn_latest_parquet"
+      )) %>%
+      filter(
+        cs_sd >= start_date &
+          pdt %in% c("B2B", "Heavy", "Flash_Heavy", 'B')
+      ) %>%
+      select(
+        wbn,
+        weight = int_wt_iwt,
+        volume = int_wt_v,
+      ) %>%
+      mutate(weight = weight / 1000.0, volume = volume / 28317.0),
+    by = 'wbn'
+  ) %>%
+  inner_join(
+    con %>%
+      tbl(in_schema("hudi_db", "hudi_facility_parquet")) %>%
+      filter(
+        property_active &
+          property_facility_active &
+          sql("property_facility_facility_type LIKE '%SC%'")
+      ) %>%
+      select(
+        cnid = property_facility_facility_code,
+        ptype = property_facility_facility_type
+      ),
+    by = 'cnid'
+  ) %>%
+  collect() ->
+  wbn_details_sc
+  
+```
+
+
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+b2b_time_per_drop <- 20 #mins
+heavy_time_per_drop <-
+  b2b_time_per_kg <- 0.036 #mins
+heavy_time_per_kg <-
+  
+  # Suppress summarise info
+  options(dplyr.summarise.inform = FALSE)
+
+#This is an approximate algo, so setting the capacity constraint as 1000kgs.
+capacity_constraint <- 700
+
+full_trip_details <- data.frame()
+
+# input_date <- min()
+# end_date <- input_date + 1
+#end_date <- max(lm_selected_sc$date, na.rm=T)
+
+#Run the loop for all the dates.
+
+while (input_date <= end_date) {
+  input_date <- as.Date(input_date, origin = '1970-01-01')
+  
+  print(input_date)
+  
+  lm_sc_adjusted_cluster %>%
+    filter(date == input_date) -> daily_fmlm
+  
+  #Get the bigger clusters for that day
+  
+  daily_clusters <- unique(daily_fmlm$loc_cluster)
+  
+  #For each of these bigger clusters, the capacitated clustering will be done
+  #i_loc_cluster == iteration counter
+  
+  for (i_loc_cluster in unique(daily_fmlm$loc_cluster)) {
+    picked_cluster_details <- data.frame()
+    
+    #The bigger cluster that is selected for the day.
+    daily_fmlm %>%
+      filter(loc_cluster == i_loc_cluster) -> daily_selected_cluster
+    
+    #These points will have a separate dedicated truck as their load is more than the capacity constraints
+    
+    daily_selected_cluster %>%
+      filter(demand > capacity_constraint) -> dedicated_trucks
+    
+    #Rest of the shipments are ordered according to their demand. This arranging is a crucial part of the algo.
+    
+    daily_selected_cluster %>%
+      filter(demand < capacity_constraint) %>%
+      arrange(desc(demand)) %>%
+      as.data.frame() %>%
+      rowid_to_column(var = 'id') -> dropping_points_ordered
+    
+    #The capacitated clusters will only form when there are enough points to form the clusters with the subsequent loads.
+    
+    #If the total demand of the rest of the dropping points is less than 300 kgs, then those points will be added with the dedicated trucks.
+    
+    if (sum(dropping_points_ordered$demand) < 300) {
+      dropping_points_ordered %>%
+        bind_rows(dedicated_trucks) %>%
+        select(-id) %>%
+        rowid_to_column(var = 'id') %>%
+        mutate(
+          cluster = 1,
+          cen_lat = mean(lat),
+          cen_long = mean(long)
+        ) -> capacitated_clustered_trips
+      
+      #Now if the demand is more than 300 but less than the capacity constraint then they can be clubbed together directly to form a cluster.
+    } else if (sum(dropping_points_ordered$demand) > 300 &
+               sum(dropping_points_ordered$demand) < (capacity_constraint + 50)) {
+      dropping_points_ordered %>%
+        select(-id) %>%
+        mutate(
+          cluster = 1,
+          cen_lat = mean(lat),
+          cen_long = mean(long)
+        ) %>%
+        bind_rows(dedicated_trucks %>%
+                    mutate(
+                      cluster = 2,
+                      cen_lat = lat,
+                      cen_long = long
+                    )) %>%
+        rowid_to_column(var = 'id') -> capacitated_clustered_trips
+    } else{
+      if (nrow(dropping_points_ordered) > 0) {
+        #Approximate number of clusters that will be formed. This is also the total number of trips.
+        
+        number_of_clusters <-
+          ceiling(sum(dropping_points_ordered$demand) / (capacity_constraint * 0.8)) +
+          2
+        
+        #For the first iteration, the centroids will be the points with larger loads
+        
+        dropping_points_ordered %>%
+          slice(1:number_of_clusters) %>%
+          select(lat, long) %>%
+          rowid_to_column(var = 'cluster') -> centroids
+        
+        #The if condition here basically states that if the number of centroids and the number of points are equal, then there is no need to run the algo.
+        #Basically, we can then treat each of the points as the center of the cluster.
+        
+        if (nrow(centroids) != nrow(dropping_points_ordered)) {
+          n_iteration <- 1
+          
+          while (n_iteration <= 20) {
+            #The cluster capacity = Max capacity of a cluster - The capacity already assigned
+            
+            cluster_capacity <-
+              capacity_constraint - as.vector(dropping_points_ordered[1:number_of_clusters, 'demand'])
+            
+            #All the points will have 'NA' from the beginning.
+            
+            cluster_list <-
+              rep(NA, nrow(dropping_points_ordered))
+            
+            #The centroids will have a defined clusters from the beginning. So the NAs for them will be replaced by numbers. These are the unique identification field for clusters.
+            
+            cluster_list[1:nrow(centroids)] <- 1:nrow(centroids)
+            
+            #Rest will be used for the capacitated clustering.
+            
+            dropping_points_ordered %>%
+              slice(c(number_of_clusters + 1:n())) -> points_for_clustering
+            
+            #i <- the iteration counter. Highlights the number of points for which we will run the algo.
+            #The initial number is equal to the number of centroids. And the maximum value it can take is equal to the number of points.
+            
+            i <- nrow(centroids)
+            
+            while (i <= (nrow(dropping_points_ordered) - 1)) {
+              #j is the index that will be used here. It signifies the index for nearest cluster.
+              #It will start from 2. Suppose we are computing the distance matrix of point p1 and n-1 other points. So we will have a matrix of 1 * n including point p1.
+              #Now the lowest distance will always be 0 because the matrix will have p1 point in it. So the index of the 2nd nearest point will be 2.
+              
+              j <- 2
+              
+              #Randomly select one point.
+              
+              selected_point <-
+                slice_sample(points_for_clustering)
+              
+              #Select the unique id of that pont
+              
+              selected_point_id <- selected_point$id
+              
+              #Remove that point from the potential group of points being considered for clustering.
+              
+              points_for_clustering %>%
+                filter(id != selected_point_id) -> points_for_clustering
+              
+              #Now basically we will assign the randomly selected point to the nearest cluster considering the cluster has the capacity.
+              
+              selected_point_demand <- selected_point$demand
+              
+              selected_point_location <-
+                selected_point[, c('lat', 'long')]
+              
+              dist_from_clusters <-
+                geodist(x = as.matrix(selected_point_location),
+                        y = as.matrix(centroids)) / 1000
+              
+              priority <-
+                dist_from_clusters / selected_point_demand
+              
+              nearest_cluster <- which.min(priority)
+              
+              nearest_cluster_capacity <-
+                cluster_capacity[nearest_cluster]
+              
+              if (selected_point_demand < nearest_cluster_capacity) {
+                cluster_list[selected_point_id] <- nearest_cluster
+                
+                dropping_points_ordered$cluster <- cluster_list
+                
+                cluster_capacity[nearest_cluster] <-
+                  nearest_cluster_capacity - selected_point_demand
+                
+              } else{
+                #If the cluster doesn't have the capacity, then assign it to the 2nd nearest cluster.
+                #Run the loop until the point is assigned.
+                
+                while (is.na(cluster_list[selected_point_id])) {
+                  nearest_cluster <- order(unlist(priority))[j]
+                  nearest_cluster_capacity <-
+                    cluster_capacity[nearest_cluster]
+                  
+                  if (selected_point_demand < nearest_cluster_capacity) {
+                    cluster_list[selected_point_id] <- nearest_cluster
+                    
+                    dropping_points_ordered$cluster <-
+                      cluster_list
+                    
+                    cluster_capacity[nearest_cluster] <-
+                      nearest_cluster_capacity - selected_point_demand
+                  } else{
+                    j <- j + 1
+                  }
+                  
+                  
+                }
+              }
+              
+              
+              i <- i + 1
+            }
+            
+            
+            dropping_points_ordered %>%
+              group_by(cluster) %>%
+              summarise(lat = mean(lat),
+                        long = mean(long)) -> centroids
+            
+            n_iteration <- n_iteration + 1
+          }
+          
+          
+          picked_cluster_details %>%
+            bind_rows(
+              centroids %>%
+                rename(cen_lat = lat, cen_long = long) %>%
+                left_join(dropping_points_ordered, by = 'cluster')
+            ) -> picked_cluster_details
+          
+        } else{
+          dropping_points_ordered %>%
+            mutate(cluster = id,
+                   cen_lat = lat,
+                   cen_long = long) -> picked_cluster_details
+        }
+        
+        capacitated_clustered_trips <- data.frame()
+        
+        for (x_date in unique(picked_cluster_details$date)) {
+          picked_cluster_details %>%
+            filter(date == x_date) -> temp_regular_cluster
+          
+          dedicated_trucks %>%
+            filter(date == x_date) %>%
+            rowid_to_column(var = 'id') %>%
+            mutate(
+              id = max(temp_regular_cluster$cluster) + id,
+              cluster = id,
+              cen_lat = lat,
+              cen_long = long
+            ) -> temp_truck
+          
+          
+          capacitated_clustered_trips %>%
+            bind_rows(temp_regular_cluster, temp_truck) -> capacitated_clustered_trips
+        }
+        
+        #Further modification
+        
+        #Select the bad trips/trucks, where the load is less than 400
+        
+        capacitated_clustered_trips %>%
+          group_by(cluster) %>%
+          summarise(demand = sum(demand), .groups = 'drop') %>%
+          filter(demand < 400) %>%
+          pull(cluster) -> bad_trucks
+        
+        capacitated_clustered_trips %>%
+          filter(cluster %in% bad_trucks) -> bad_truck_details
+        
+        #Select the good trips/trucks
+        
+        capacitated_clustered_trips %>%
+          group_by(cluster) %>%
+          summarise(demand = sum(demand), .groups = 'drop') %>%
+          filter(demand > 400) %>%
+          pull(cluster) -> good_trucks
+        
+        capacitated_clustered_trips %>%
+          filter(cluster %in% good_trucks) -> good_truck_details
+        
+        bad_trucks <- c(bad_trucks)
+        
+        modified_bad_truck <- data.frame()
+        
+        #This code chunk will only be executed if there is at-least one bad truck.
+        #The load of the bad cluster will be allocated to the nearest good cluster.
+        
+        if (nrow(bad_truck_details) > 0) {
+          if (nrow(good_truck_details) == 0) {
+            bad_truck_details %>%
+              mutate(cluster = 1) %>%
+              group_by(cluster) %>%
+              mutate(cen_lat = mean(lat),
+                     cen_long = mean(long)) %>%
+              ungroup() -> capacitated_clustered_trips
+            
+            
+          } else{
+            for (i_bad_trucks in 1:nrow(bad_truck_details)) {
+              bad_truck_details[i_bad_trucks,] -> selected_bad_truck
+              
+              truck_distances <-
+                rdist(x1 = selected_bad_truck[, c('lat', 'long')], x2 = good_truck_details[, c('cen_lat', 'cen_long')]) *
+                110
+              
+              nearest_truck <- which.min(truck_distances)
+              
+              good_truck_details %>%
+                slice(nearest_truck) -> nearest_good_truck
+              
+              selected_bad_truck$cluster <-
+                nearest_good_truck$cluster
+              
+              modified_bad_truck %>%
+                bind_rows(selected_bad_truck) -> modified_bad_truck
+            }
+            
+            good_truck_details %>%
+              bind_rows(modified_bad_truck) %>%
+              group_by(cluster) %>%
+              mutate(cen_lat = mean(lat),
+                     cen_long = mean(long)) %>%
+              ungroup() -> capacitated_clustered_trips
+            
+          }
+          
+          
+        }
+        
+      } else{
+        capacitated_clustered_trips <- data.frame()
+        
+        for (x_date in unique(dedicated_trucks$date)) {
+          dedicated_trucks %>%
+            filter(date == x_date) %>%
+            rowid_to_column(var = 'id') %>%
+            mutate(cluster = id,
+                   cen_lat = lat,
+                   cen_long = long) -> dedicated_trucks
+          
+          capacitated_clustered_trips %>%
+            bind_rows(dedicated_trucks) -> capacitated_clustered_trips
+        }
+      }
+      
+    }
+    
+    capacitated_clustered_trips %>%
+      group_by(cluster, km_cen_lat, km_cen_long) %>%
+      count() %>%
+      ungroup() %>%
+      group_by(cluster) %>%
+      mutate(perc = n / sum(n)) %>%
+      slice_max(perc, n = 1) %>%
+      ungroup() %>%
+      distinct(cluster, km_cen_lat, km_cen_long) %>%
+      left_join(capacitated_clustered_trips %>% select(-km_cen_lat, -km_cen_long),
+                by = "cluster") -> capacitated_clustered_trips
+    
+    #TSP for each trip to calculate the time to serve the cluster.
+    
+    picked_cluster_details <- capacitated_clustered_trips
+    picked_tsp <- data.frame()
+    
+    for (x_cluster in unique(picked_cluster_details$cluster)) {
+      picked_cluster_details %>%
+        filter(cluster == x_cluster) -> selected_cluster
+      
+      if (nrow(selected_cluster) > 1) {
+        distance_list <-
+          osrmTable(loc = selected_cluster[, c('id', 'long', 'lat')], measure = 'distance')
+        
+        tsp_matrix <-
+          ((distance_list$distances) / 1000) * (60 / truck_speed)
+        
+      } else{
+        tsp_matrix <- as.matrix(0, 1, 1)
+      }
+      
+      atsp <- ATSP(tsp_matrix)
+      tour <- solve_TSP(atsp, method = "nn")
+      
+      picked_tsp %>%
+        bind_rows(
+          data.frame(
+            date = as.Date(input_date),
+            cluster = x_cluster,
+            tsp_distance = (tour_length(tour) * (truck_speed / 60)),
+            tsp_time = tour_length(tour)
+          )
+        ) -> picked_tsp
+      
+    }
+    
+    
+    picked_cluster_details %>%
+      group_by(cluster,
+               date,
+               cen_lat,
+               cen_long,
+               purpose,
+               loc_cluster,
+               km_cen_lat,
+               km_cen_long) %>%
+      summarise(count = n(),
+                demand = sum(demand),
+                .groups = 'drop') %>%
+      ungroup() %>%
+      inner_join(picked_tsp, by = c("cluster", "date")) %>%
+      mutate(serving_time = ((count * time_per_drop) + (demand * time_per_kg))) -> picked_full_details
+    
+    full_trip_details %>%
+      bind_rows(picked_full_details) -> full_trip_details
+  }
+  
+  print(paste0('Done for the day: ', input_date, ' ', Sys.time()))
+  
+  #Move on to the next day.
+}
+```
+
