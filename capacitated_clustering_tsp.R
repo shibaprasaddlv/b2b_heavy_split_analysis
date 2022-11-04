@@ -1,4 +1,4 @@
-#Define all the constreaints here (like the 300kgs)
+#Define all the constreaints here like the 300kg
 
 CapClusteringWithTSP <-
   function(lm_sc_adjusted_cluster,
